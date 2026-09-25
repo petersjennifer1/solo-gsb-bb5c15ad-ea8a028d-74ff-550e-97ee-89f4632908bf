@@ -12,4 +12,5 @@ services:
       # 可选限制（默认值见 app.py）
       MAX_FOLDS: "${MAX_FOLDS:-8}"
       MAX_HOLES: "${MAX_HOLES:-24}"
+      MAX_ZONES: "${MAX_ZONES:-8}"
     restart: unless-stopped

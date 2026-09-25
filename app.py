@@ -17,6 +17,10 @@
   这一次打孔必然生成的全部孔位。目标孔心距纸张边界/折痕不大于打孔半径时
   拒绝并说明具体原因。
 - 全部折痕展开后构成 (2^nv - 1) x (2^nh - 1) 的等分网格。
+- 原纸保护区：原纸上至多 MAX_ZONES 个轴对齐矩形（mm 坐标），绘入展开图。
+  任一展开孔圆与任一保护区相交或相切即违规：指出原打孔点、触碰的展开孔
+  及保护区，不生成展开 SVG、禁止下载；反查打孔的待确认结果同样判定。
+  保护区必须完整位于原纸内，纸张尺寸改动导致越界时提示修正。
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 MAX_FOLDS = int(os.environ.get("MAX_FOLDS", "8"))
 MAX_HOLES = int(os.environ.get("MAX_HOLES", "24"))
+MAX_ZONES = int(os.environ.get("MAX_ZONES", "8"))
 MIN_DIM = 20.0          # mm
 MAX_DIM = 2000.0        # mm
 MIN_RADIUS = 0.5        # mm
@@ -201,6 +206,61 @@ def crease_grid(width, height, nv, nh):
 
 
 # ---------------------------------------------------------------------------
+# 原纸保护区（轴对齐矩形，原纸 mm 坐标）
+# ---------------------------------------------------------------------------
+def circle_touches_zone(cx, cy, radius, z):
+    """孔圆与轴对齐矩形保护区是否相交或相切（含 EDGE_TOL 容差）。
+
+    圆心到矩形的最近距离 <= 半径即相交/相切；保护区为禁入区域，
+    相切也算违规。
+    """
+    dx = max(z["x"] - cx, 0.0, cx - (z["x"] + z["w"]))
+    dy = max(z["y"] - cy, 0.0, cy - (z["y"] + z["h"]))
+    limit = radius + EDGE_TOL
+    return dx * dx + dy * dy <= limit * limit
+
+
+def zone_out_of_bounds(zones, width, height):
+    """返回第一个越出原纸的保护区下标；都在纸内返回 None。"""
+    for i, z in enumerate(zones):
+        if (z["x"] + z["w"] > width + EDGE_TOL
+                or z["y"] + z["h"] > height + EDGE_TOL):
+            return i
+    return None
+
+
+def zone_bounds_msg(i, z, width, height):
+    return (f"保护区 #{i + 1}（x {z['x']:g} ~ {z['x'] + z['w']:g}mm，"
+            f"y {z['y']:g} ~ {z['y'] + z['h']:g}mm）超出原纸 "
+            f"{width:g} × {height:g}mm 的范围，请修正或删除该保护区。")
+
+
+def zone_hit_msg(prefix, hx, hy, zi, z, radius):
+    return (f"{prefix}展开后的孔 ({hx:.2f}, {hy:.2f})mm 与保护区 #{zi + 1}"
+            f"（x {z['x']:g} ~ {z['x'] + z['w']:g}mm，"
+            f"y {z['y']:g} ~ {z['y'] + z['h']:g}mm）相交或相切"
+            f"（孔半径 {radius:g}mm，保护区为禁入区域），"
+            "请移开打孔点或调整保护区。")
+
+
+def find_zone_hit(raw_holes, zones, radius, n_images):
+    """在展开后的原始孔位（未去重）中找第一个触碰保护区的孔。
+
+    raw_holes 按 unfold_points 的输出顺序排列：第 k 个孔来自第
+    k // n_images 个打孔点（每个打孔点恰好展开出 n_images = 2^折数 个
+    原始孔位）。返回 (打孔点下标, 孔坐标, 保护区下标) 或 None。
+    """
+    if not zones or not raw_holes:
+        return None
+    for k, (x, y) in enumerate(raw_holes):
+        src = k // n_images
+        for zi, z in enumerate(zones):
+            if circle_touches_zone(x, y, radius, z):
+                return src, {"x": round(x, 6), "y": round(y, 6)}, zi
+    return None
+
+
+# ---------------------------------------------------------------------------
 # SVG 生成
 # ---------------------------------------------------------------------------
 def _svg_header(w_mm, h_mm):
@@ -219,13 +279,13 @@ def _circle(cx, cy, r, extra=""):
             f'fill="#dc2626" stroke="#7f1d1d" stroke-width="0.12"{extra}/>\n')
 
 
-def build_unfolded_svg(width, height, holes, creases, radius, nv, nh):
+def build_unfolded_svg(width, height, holes, creases, radius, nv, nh, zones):
     """展开图 SVG。y 由数学坐标（自下而上）换算为 SVG 坐标（自上而下）。"""
     w, h, r = float(width), float(height), float(radius)
     parts = [_svg_header(w, h)]
     parts.append(
         f'<desc>纸张 {w:g}x{h:g}mm；垂直对折 {nv} 次、水平对折 {nh} 次；'
-        f'共 {len(holes)} 个孔</desc>\n')
+        f'保护区 {len(zones)} 个；共 {len(holes)} 个孔</desc>\n')
     for c in creases:
         if c["orient"] == "v":
             parts.append(
@@ -236,6 +296,18 @@ def build_unfolded_svg(width, height, holes, creases, radius, nv, nh):
             parts.append(
                 f'<line x1="0" y1="{yy:.3f}" x2="{w:.3f}" y2="{yy:.3f}" '
                 'stroke="#9ca3af" stroke-width="0.2" stroke-dasharray="2 1.5"/>\n')
+    # 原纸保护区：绿色半透明填充 + 虚线边框，标序号
+    for zi, z in enumerate(zones):
+        zy_svg = h - (z["y"] + z["h"])
+        parts.append(
+            f'<rect x="{z["x"]:.3f}" y="{zy_svg:.3f}" '
+            f'width="{z["w"]:.3f}" height="{z["h"]:.3f}" '
+            'fill="#16a34a" fill-opacity="0.10" stroke="#15803d" '
+            'stroke-width="0.4" stroke-dasharray="2.5 1.8"/>\n')
+        if z["w"] >= 8.0 and z["h"] >= 4.5:
+            parts.append(
+                f'<text x="{z["x"] + 1.0:.3f}" y="{zy_svg + 3.4:.3f}" '
+                f'font-size="3" fill="#15803d">保{zi + 1}</text>\n')
     for hp in holes:
         parts.append(_circle(hp["x"], h - hp["y"], r))
     parts.append("</svg>\n")
@@ -327,12 +399,36 @@ def _check_face_capacity(w, h, radius):
             "请减少折叠次数或减小打孔半径。")
 
 
+def _validate_zones(payload):
+    """校验保护区结构：至多 MAX_ZONES 个轴对齐矩形 {x, y, w, h}（原纸 mm）。
+
+    只校验格式与取值范围；是否越出原纸由调用方结合纸张尺寸判定
+    （compute 按孔位错误同款方式返回 200 + error，reverse 抛 ValueError）。
+    """
+    zones = payload.get("zones", [])
+    if not isinstance(zones, list) or len(zones) > MAX_ZONES:
+        raise ValueError(f"保护区数量须为 0 ~ {MAX_ZONES} 个")
+    out = []
+    for i, z in enumerate(zones):
+        if not isinstance(z, dict):
+            raise ValueError("保护区格式错误")
+        zx = _num(z, "x", 0.0, MAX_DIM, f"保护区 #{i + 1} 的 x")
+        zy = _num(z, "y", 0.0, MAX_DIM, f"保护区 #{i + 1} 的 y")
+        zw = _num(z, "w", 0.0, MAX_DIM, f"保护区 #{i + 1} 的宽")
+        zh = _num(z, "h", 0.0, MAX_DIM, f"保护区 #{i + 1} 的高")
+        if zw <= 0.0 or zh <= 0.0:
+            raise ValueError(f"保护区 #{i + 1} 的宽和高必须大于 0")
+        out.append({"x": zx, "y": zy, "w": zw, "h": zh})
+    return out
+
+
 def compute(payload):
     """核心计算。成功返回结果 dict，失败抛出 ValueError。"""
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
 
     width, height, radius, folds = _validate_sheet(payload)
+    zones = _validate_zones(payload)
 
     points = payload.get("points", [])
     if not isinstance(points, list) or len(points) > MAX_HOLES:
@@ -351,19 +447,39 @@ def compute(payload):
     mm_pts = [{"x": p["x"] * w, "y": p["y"] * h} for p in norm_pts]
 
     error_msg, error_idx = None, -1
+    zone_error = None
     holes, creases, unfolded_svg = [], [], None
-    for i, p in enumerate(mm_pts):
-        err = check_point(p["x"], p["y"], w, h, radius, edges)
-        if err:
-            error_msg, error_idx = err, i
-            break
+
+    # 保护区必须完整位于原纸内（纸张尺寸改小导致越界时在此提示修正）
+    oob = zone_out_of_bounds(zones, width, height)
+    if oob is not None:
+        error_msg = zone_bounds_msg(oob, zones[oob], width, height)
+        zone_error = {"kind": "bounds", "zoneIndex": oob}
+
+    if error_msg is None:
+        for i, p in enumerate(mm_pts):
+            err = check_point(p["x"], p["y"], w, h, radius, edges)
+            if err:
+                error_msg, error_idx = err, i
+                break
 
     if error_msg is None:
         raw = unfold_points(mm_pts, folds, width, height)
-        holes = dedupe_points(raw)
-        creases = crease_grid(width, height, nv, nh)
-        unfolded_svg = build_unfolded_svg(
-            width, height, holes, creases, radius, nv, nh)
+        # 任一展开孔圆与任一保护区相交/相切：指出原打孔点、展开孔与保护区
+        hit = find_zone_hit(raw, zones, radius, 2 ** len(folds))
+        if hit:
+            src, hole, zi = hit
+            p = mm_pts[src]
+            error_msg, error_idx = zone_hit_msg(
+                f"打孔点 #{src + 1}（折叠面 ({p['x']:.2f}, {p['y']:.2f})mm）",
+                hole["x"], hole["y"], zi, zones[zi], radius), src
+            zone_error = {"kind": "hit", "pointIndex": src,
+                          "hole": hole, "zoneIndex": zi}
+        else:
+            holes = dedupe_points(raw)
+            creases = crease_grid(width, height, nv, nh)
+            unfolded_svg = build_unfolded_svg(
+                width, height, holes, creases, radius, nv, nh, zones)
 
     folded_svg, pad, vb_w, vb_h = build_folded_svg(
         w, h, edges, mm_pts, radius, error_idx)
@@ -384,6 +500,7 @@ def compute(payload):
         "unfoldedSvg": unfolded_svg,
         "error": error_msg,
         "errorIndex": error_idx,
+        "zoneError": zone_error,
     }
 
 
@@ -391,12 +508,13 @@ def reverse_lookup(payload):
     """反查打孔：原纸上的目标孔心 -> 最终折叠面的归一化孔心 + 全部连带孔位。
 
     目标点或折回后的孔心若使打孔半径触及纸张边界/折痕，抛出带具体原因的
-    ValueError，客户端据此禁止确认。
+    ValueError，客户端据此禁止确认。连带孔与保护区相交/相切时同样拒绝。
     """
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
 
     width, height, radius, folds = _validate_sheet(payload)
+    zones = _validate_zones(payload)
 
     target = payload.get("target")
     if not isinstance(target, dict):
@@ -406,6 +524,11 @@ def reverse_lookup(payload):
 
     w, h, edges, nv, nh = folded_state(width, height, folds)
     _check_face_capacity(w, h, radius)
+
+    # 保护区必须完整位于原纸内
+    oob = zone_out_of_bounds(zones, width, height)
+    if oob is not None:
+        raise ValueError(zone_bounds_msg(oob, zones[oob], width, height))
 
     # 目标孔心在原纸上的校验（边界 + 全部折痕）
     err = check_target_on_paper(tx, ty, width, height, radius, nv, nh)
@@ -421,7 +544,17 @@ def reverse_lookup(payload):
         raise ValueError(f"反查到折叠面的{err}")
 
     # 复用现有展开算法，列出这一次打孔必然生成的全部孔位
-    holes = dedupe_points(unfold_points([{"x": fx, "y": fy}], folds, width, height))
+    raw = unfold_points([{"x": fx, "y": fy}], folds, width, height)
+
+    # 与折叠面打孔同一判定：任一连带孔圆触碰保护区即拒绝
+    hit = find_zone_hit(raw, zones, radius, 2 ** len(folds))
+    if hit:
+        _, hole, zi = hit
+        raise ValueError(zone_hit_msg(
+            f"反查打孔（目标孔心 ({tx:.2f}, {ty:.2f})mm）",
+            hole["x"], hole["y"], zi, zones[zi], radius))
+
+    holes = dedupe_points(raw)
 
     return {
         "ok": True,
@@ -442,7 +575,7 @@ def reverse_lookup(payload):
 def index():
     return render_template(
         "index.html",
-        max_folds=MAX_FOLDS, max_holes=MAX_HOLES,
+        max_folds=MAX_FOLDS, max_holes=MAX_HOLES, max_zones=MAX_ZONES,
         min_dim=MIN_DIM, max_dim=MAX_DIM,
         min_radius=MIN_RADIUS, max_radius=MAX_RADIUS)
 
@@ -460,7 +593,7 @@ def api_unfold():
 
 @app.route("/api/reverse", methods=["POST"])
 def api_reverse():
-    """反查打孔：入参 {width, height, radius, folds, target:{x,y}(原纸 mm)}。"""
+    """反查打孔：入参 {width, height, radius, folds, zones, target:{x,y}(原纸 mm)}。"""
     payload = request.get_json(force=True, silent=True)
     if payload is None:
         return _bad("请求不是合法 JSON")
