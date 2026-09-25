@@ -68,6 +68,25 @@
   }
   ol.folds .txt { flex:1; font-size:12.5px; }
   ol.folds button { padding:2px 7px; font-size:12px; }
+  ol.areas {
+    list-style:none; margin:8px 0 0; padding:0;
+    display:flex; flex-direction:column; gap:6px;
+  }
+  ol.areas li {
+    border:1px solid var(--line); border-radius:6px; padding:6px 8px;
+    display:flex; align-items:center; gap:8px; background:#fffbeb;
+  }
+  ol.areas li.bad { border-color:var(--red); background:#fef2f2; }
+  ol.areas .idx {
+    width:20px; height:20px; border-radius:4px; background:var(--amber);
+    color:#fff; font-size:11px; display:flex; align-items:center;
+    justify-content:center; flex:none;
+  }
+  ol.areas li.bad .idx { background:var(--red); }
+  ol.areas .txt { flex:1; font-size:12.5px; }
+  ol.areas .txt b { font-weight:650; }
+  ol.areas .txt small { color:var(--muted); }
+  ol.areas button { padding:2px 7px; font-size:12px; }
   .empty { color:var(--muted); font-size:12.5px; margin:8px 0 0; }
   .presets { margin-top:4px; display:flex; gap:6px; flex-wrap:wrap; }
   .presets button { font-size:12px; padding:3px 8px; }
@@ -101,6 +120,11 @@
   }
   .legend .preview i {
     height:10px; width:10px; border-radius:50%; background:#f59e0b; border:none;
+  }
+  .legend .area i {
+    height:10px; width:16px; border:none; border-radius:2px;
+    background:repeating-linear-gradient(45deg,#fef3c7,#fef3c7 2px,#d97706 2px,#d97706 3px);
+    border:1px solid #b45309;
   }
   .status {
     margin-top:10px; border-radius:6px; padding:8px 10px; font-size:12.5px;
@@ -160,6 +184,29 @@
       <button type="button" id="btnClearFolds" class="danger">清空折法</button>
     </div>
 
+    <h2 style="margin-top:16px">原纸保护区 <small id="areaCountLabel">0 / {{ max_areas }}</small></h2>
+    <p class="hint">在原纸上录入至多 {{ max_areas }} 个<b>轴对齐矩形保护区</b>（单位 mm，
+      原点在纸面左下角）。展开后任一孔圆与保护区相交或相切（含 0.05mm 容差）时，
+      展开图与 SVG 下载都会被禁止，并指出触碰的展开孔。保护区必须完整位于原纸内。</p>
+    <div class="row2" style="grid-template-columns:1fr 1fr;">
+      <label class="field"><span>左下角 x (mm)</span>
+        <input type="number" id="inAx" min="0" step="1" placeholder="0"></label>
+      <label class="field"><span>左下角 y (mm)</span>
+        <input type="number" id="inAy" min="0" step="1" placeholder="0"></label>
+    </div>
+    <div class="row2">
+      <label class="field"><span>保护区宽 w (mm)</span>
+        <input type="number" id="inAw" min="0.1" step="1" placeholder="20"></label>
+      <label class="field"><span>保护区高 h (mm)</span>
+        <input type="number" id="inAh" min="0.1" step="1" placeholder="20"></label>
+    </div>
+    <div class="toolbar">
+      <button type="button" id="btnAddArea" class="primary">添加保护区</button>
+      <button type="button" id="btnClearAreas" class="danger">清空保护区</button>
+    </div>
+    <ol class="areas" id="areaList"></ol>
+    <p class="empty" id="areaEmpty">尚无保护区（孔可打在原纸任意合法位置）。</p>
+
     <h2 style="margin-top:16px">打孔点 <small id="holeCountLabel">0 / {{ max_holes }}</small></h2>
     <p class="hint">在中间折叠面的<span style="color:var(--green)">绿色虚线安全框</span>内单击添加；
       单击已有孔（2mm 内）可删除。也可在右侧展开图开启「反查打孔」，
@@ -197,6 +244,7 @@
       <div class="legend">
         <span class="crease"><i></i>折痕</span>
         <span class="hole"><i></i>孔</span>
+        <span class="area"><i></i>保护区</span>
         <span class="preview"><i></i>待确认反查孔位</span>
       </div>
       <div class="toolbar">
@@ -220,8 +268,10 @@
 (function () {
   var MAX_FOLDS = {{ max_folds }};
   var MAX_HOLES = {{ max_holes }};
+  var MAX_AREAS = {{ max_areas }};
   var DELETE_PICK_MM = 2.0;      // 点击距已有孔小于该值则删除
   var CLICK_TOL_NORM = 0.004;    // 归一化点击越界容差
+  var AREA_TOL = 0.05;           // mm，与服务端 PROTECT_TOL 一致
 
   var FOLD_TEXT = {
     vR: "垂直对折，右侧折向左侧（左半不动）",
@@ -230,8 +280,10 @@
     hB: "水平对折，下侧折向上侧（上半不动）"
   };
 
-  // 状态：points 为最终折叠面上的【归一化】坐标 {x,y} ∈ [0,1]
-  var state = { width: 210, height: 297, radius: 3, folds: ["vR"], points: [] };
+  // 状态：points 为最终折叠面上的【归一化】坐标 {x,y} ∈ [0,1]；
+  // areas 为原纸上的保护区矩形 [{x,y,w,h}]，左下角 mm 坐标
+  var state = { width: 210, height: 297, radius: 3, folds: ["vR"],
+                points: [], areas: [] };
   var lastResult = null;
   var reqSeq = 0;
   var inflight = false;
@@ -282,6 +334,82 @@
     el.textContent = msg || "";
   }
 
+  // ---------------- 渲染：保护区列表 ----------------
+  function renderAreaList() {
+    var ol = $("areaList");
+    var bad = {};
+    if (lastResult && lastResult.badAreaIndices) {
+      lastResult.badAreaIndices.forEach(function (i) { bad[i] = true; });
+    }
+    ol.innerHTML = "";
+    state.areas.forEach(function (a, i) {
+      var li = document.createElement("li");
+      if (bad[i]) li.className = "bad";
+      var idx = document.createElement("span");
+      idx.className = "idx"; idx.textContent = "P" + (i + 1);
+      var txt = document.createElement("span");
+      txt.className = "txt";
+      var over = a.x + a.w > state.width + AREA_TOL ||
+                 a.y + a.h > state.height + AREA_TOL;
+      txt.innerHTML = "<b>P" + (i + 1) + "</b> 左下 (" +
+        a.x + ", " + a.y + ") mm，" + a.w + " × " + a.h + " mm" +
+        (over ? "<br><small style='color:var(--red)'>超出当前纸张，请修正</small>" : "");
+      var del = document.createElement("button");
+      del.className = "danger"; del.type = "button"; del.textContent = "删除";
+      del.addEventListener("click", function () {
+        state.areas.splice(i, 1);
+        clearPending();
+        renderAreaList();
+        schedule(true);
+      });
+      li.appendChild(idx); li.appendChild(txt); li.appendChild(del);
+      ol.appendChild(li);
+    });
+    $("areaEmpty").style.display = state.areas.length ? "none" : "block";
+    $("areaCountLabel").textContent = state.areas.length + " / " + MAX_AREAS;
+    $("btnAddArea").disabled = state.areas.length >= MAX_AREAS;
+  }
+
+  // ---------------- 保护区录入 ----------------
+  function addAreaFromInputs() {
+    var vals = ["inAx", "inAy", "inAw", "inAh"].map(function (id) {
+      return parseFloat($(id).value);
+    });
+    var x = vals[0], y = vals[1], w = vals[2], h = vals[3];
+    if (!vals.every(isFinite)) {
+      setStatus("warn", "请填写完整的保护区坐标与宽高（数字，单位 mm）。");
+      return;
+    }
+    if (x < 0 || y < 0) {
+      setStatus("warn", "保护区左下角坐标不能为负（原点在原纸左下角）。");
+      return;
+    }
+    if (w <= 0 || h <= 0) {
+      setStatus("warn", "保护区的宽度和高度必须大于 0。");
+      return;
+    }
+    if (state.areas.length >= MAX_AREAS) {
+      setStatus("warn", "保护区数量已达上限 " + MAX_AREAS + " 个。");
+      return;
+    }
+    // 必须完整位于当前原纸内（允许贴边）
+    if (x > state.width + AREA_TOL || y > state.height + AREA_TOL ||
+        x + w > state.width + AREA_TOL || y + h > state.height + AREA_TOL) {
+      setStatus("warn",
+        "保护区超出当前纸张（" + state.width + " × " + state.height +
+        " mm）：请调整坐标/宽高，或先修改纸张尺寸。");
+      return;
+    }
+    state.areas.push({
+      x: +x.toFixed(3), y: +y.toFixed(3),
+      w: +w.toFixed(3), h: +h.toFixed(3)
+    });
+    clearPending();
+    renderAreaList();
+    schedule(true);
+    setStatus("", "");
+  }
+
   // ---------------- 服务端计算 ----------------
   function schedule(immediate) {
     if (debounceTimer) clearTimeout(debounceTimer);
@@ -325,27 +453,35 @@
       "<b>" + f.layers + "</b> 层；折叠面尺寸 <b>" + f.width + " × " + f.height +
       "</b> mm。蓝虚线为折痕边，黑实线为纸张开口边。";
 
-    // 展开图
+    // 保护区列表（越界项红色高亮）
+    renderAreaList();
+
+    // 展开图：孔位非法或触碰保护区时，服务端返回只含纸张/折痕/保护区的预览
+    var blocked = !!(d.error || d.areaError);
     var wrap = $("unfoldedSvgWrap");
-    if (d.error) {
-      wrap.innerHTML = '<span class="placeholder">孔位不合法，暂不生成展开图</span>';
-      $("holeMeta").textContent = "";
-      $("btnDownload").disabled = true;
-      $("downloadHint").textContent = "";
-      setStatus("err", d.error);
-    } else {
+    if (d.unfoldedSvg) {
       renderUnfolded();
-      $("holeMeta").textContent = state.width + " × " + state.height + " mm";
+    } else {
+      wrap.innerHTML = '<span class="placeholder">孔位不合法，暂不生成展开图</span>';
+    }
+    $("holeMeta").textContent = state.width + " × " + state.height + " mm";
+    $("holeCountLabel").textContent = state.points.length + " / " + MAX_HOLES;
+
+    if (blocked) {
+      $("btnDownload").disabled = true;
+      $("downloadHint").textContent = "存在未解决问题，无法下载展开 SVG。";
+      setStatus("err", d.areaError || d.error);
+    } else {
       $("btnDownload").disabled = false;
       var merged = d.holeCount < d.expectedCount;
       $("downloadHint").textContent = merged
         ? "存在重合孔位，已自动只画一次。" : "";
       var msg = "展开完成：共 " + d.holeCount + " 个孔";
+      if (state.areas.length) msg += "，保护区 " + state.areas.length + " 个";
       if (merged) msg += "（理论 " + d.expectedCount + " 个，重合位置已合并）";
       msg += "。";
       setStatus("ok", msg);
     }
-    $("holeCountLabel").textContent = state.points.length + " / " + MAX_HOLES;
   }
 
   // 折叠面重绘（含反查预览标记）
@@ -360,7 +496,7 @@
   // 展开图重绘（含反查预览高亮）
   function renderUnfolded() {
     var wrap = $("unfoldedSvgWrap");
-    if (!lastResult || lastResult.error) {
+    if (!lastResult || !lastResult.unfoldedSvg) {
       wrap.innerHTML = '<span class="placeholder">孔位不合法，暂不生成展开图</span>';
       return;
     }
@@ -459,7 +595,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         width: state.width, height: state.height, radius: state.radius,
-        folds: state.folds,
+        folds: state.folds, areas: state.areas,
         target: { x: +pt.x.toFixed(6), y: +pt.y.toFixed(6) }
       })
     }).then(function (resp) {
@@ -612,6 +748,20 @@
     schedule(true);
   });
 
+  $("btnAddArea").addEventListener("click", addAreaFromInputs);
+  ["inAx", "inAy", "inAw", "inAh"].forEach(function (id) {
+    $(id).addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") addAreaFromInputs();
+    });
+  });
+  $("btnClearAreas").addEventListener("click", function () {
+    if (!state.areas.length) return;
+    state.areas = [];
+    clearPending();
+    renderAreaList();
+    schedule(true);
+  });
+
   document.querySelectorAll("[data-preset]").forEach(function (b) {
     b.addEventListener("click", function () {
       var p = b.getAttribute("data-preset");
@@ -632,7 +782,8 @@
     this.textContent = reverseMode ? "反查打孔：开" : "反查打孔：关";
     $("reverseHint").textContent = reverseMode
       ? "反查模式：在展开图上点击目标孔心，系统按当前折法逐层折回折叠面，" +
-        "并高亮本次打孔必然生成的全部孔位；确认后才加入现有打孔点。"
+        "并高亮本次打孔必然生成的全部孔位；确认后才加入现有打孔点。" +
+        "若任一连带孔触碰保护区，将直接拒绝并说明触碰的孔与保护区。"
       : "";
     clearPending();
     renderUnfolded();
@@ -687,6 +838,7 @@
 
   // ---------------- 启动 ----------------
   renderFoldList();
+  renderAreaList();
   schedule(true);
 })();
 </script>

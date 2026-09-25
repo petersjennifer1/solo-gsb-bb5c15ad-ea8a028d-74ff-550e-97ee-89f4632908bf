@@ -16,6 +16,10 @@
   中线镜像），逐层折回最终折叠面，得到归一化孔心；再用同一展开算法列出
   这一次打孔必然生成的全部孔位。目标孔心距纸张边界/折痕不大于打孔半径时
   拒绝并说明具体原因。
+- 原纸保护区：至多 MAX_PROTECTED_AREAS 个轴对齐矩形（mm，原纸坐标，
+  左下角定位），必须完整位于原纸内。任一打孔点展开出的任一孔圆与任一
+  保护区相交或相切（带 PROTECT_TOL 容差）时，报明原打孔点、触碰的展开孔
+  与保护区编号，拒绝生成/下载展开 SVG；反查打孔的待确认结果执行同一判定。
 - 全部折痕展开后构成 (2^nv - 1) x (2^nh - 1) 的等分网格。
 """
 
@@ -33,11 +37,14 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 MAX_FOLDS = int(os.environ.get("MAX_FOLDS", "8"))
 MAX_HOLES = int(os.environ.get("MAX_HOLES", "24"))
+MAX_PROTECTED_AREAS = int(os.environ.get("MAX_PROTECTED_AREAS", "8"))
 MIN_DIM = 20.0          # mm
 MAX_DIM = 2000.0        # mm
 MIN_RADIUS = 0.5        # mm
 MAX_RADIUS = 50.0       # mm
 EDGE_TOL = 0.05         # mm，边界判定容差（浮点误差 + 必须严格在内侧）
+PROTECT_TOL = 0.05      # mm，孔圆与保护区"相切"判定容差（>= -tol 即视为触碰）
+MIN_AREA_SIDE = 0.1     # mm，保护区边长下限（必须为正）
 
 ALLOWED_FOLDS = ("vL", "vR", "hT", "hB")
 EDGE_NAMES = {
@@ -201,6 +208,89 @@ def crease_grid(width, height, nv, nh):
 
 
 # ---------------------------------------------------------------------------
+# 原纸保护区
+# ---------------------------------------------------------------------------
+def validate_areas(payload, width, height):
+    """解析并校验保护区列表。
+
+    保护区为轴对齐矩形，字段 {x, y, w, h}：(x,y) 为左下角 mm 坐标。
+    必须完整位于原纸内（允许贴边）。返回 (norm_areas, bad_indices, message)。
+    字段格式类错误（非数字/非对象）抛 ValueError；越界类错误不抛，
+    而是把下标记入 bad_indices 并给出修正提示——纸张尺寸改动时不应让整个
+    接口 400，前端仍需拿到折叠面几何与带红框的展开预览。
+    """
+    raw = payload.get("areas", [])
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list) or len(raw) > MAX_PROTECTED_AREAS:
+        raise ValueError(f"保护区数量须为 0 ~ {MAX_PROTECTED_AREAS} 个")
+
+    areas, bad, oob_msgs = [], [], []
+    for i, a in enumerate(raw):
+        if not isinstance(a, dict):
+            raise ValueError(f"第 {i + 1} 个保护区格式错误，须为对象")
+        ax = _num(a, "x", 0.0, width, f"第 {i + 1} 个保护区左下角 x")
+        ay = _num(a, "y", 0.0, height, f"第 {i + 1} 个保护区左下角 y")
+        aw = _num(a, "w", MIN_AREA_SIDE, MAX_DIM, f"第 {i + 1} 个保护区宽度")
+        ah = _num(a, "h", MIN_AREA_SIDE, MAX_DIM, f"第 {i + 1} 个保护区高度")
+        areas.append({"x": ax, "y": ay, "w": aw, "h": ah})
+        if ax + aw > width + EDGE_TOL or ay + ah > height + EDGE_TOL:
+            bad.append(i)
+            oob_msgs.append(
+                f"保护区 P{i + 1}（左下角 ({ax:g}, {ay:g})，{aw:g} × {ah:g}mm）"
+                f"超出当前纸张 {width:g} × {height:g}mm，"
+                f"右边界 {ax + aw:g}mm / 上边界 {ay + ah:g}mm，"
+                "请修改保护区或纸张尺寸。")
+
+    msg = None
+    if bad:
+        msg = "有保护区位于原纸之外，已用红色虚框标出，请修正后才能生成展开图：" + "；".join(oob_msgs)
+    norm = [{"x": round(a["x"], 6), "y": round(a["y"], 6),
+             "w": round(a["w"], 6), "h": round(a["h"], 6)} for a in areas]
+    return norm, bad, msg
+
+
+def circle_rect_distance(cx, cy, r, rect):
+    """圆与轴对齐矩形的最近距离（负值表示圆与矩形相交）。
+
+    先算圆心到矩形的最近距离 d（圆心在矩形内时 d = 0，按最深轴距离取负），
+    返回 d - r：<= 0 即相交或相切。
+    """
+    rx, ry, rw, rh = rect["x"], rect["y"], rect["w"], rect["h"]
+    if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+        # 圆心在矩形内：取圆心到四条边距离的最小值（负值）
+        return -min(cx - rx, rx + rw - cx, cy - ry, ry + rh - cy) - r
+    dx = max(rx - cx, 0.0, cx - (rx + rw))
+    dy = max(ry - cy, 0.0, cy - (ry + rh))
+    return math.hypot(dx, dy) - r
+
+
+def _area_text(idx, z):
+    return (f"保护区 P{idx + 1}（左下角 ({z['x']:g}, {z['y']:g})，"
+            f"{z['w']:g} × {z['h']:g}mm）")
+
+
+def find_area_conflict(holes, radius, areas, source_desc):
+    """检查一组展开孔是否与任一保护区相交或相切（带 PROTECT_TOL 容差）。
+
+    source_desc 说明这些孔来自哪个原打孔点。命中时返回中文错误信息，
+    指明原打孔点、触碰的展开孔坐标、保护区编号及侵入/间隙距离；否则 None。
+    """
+    for hp in holes:
+        for zi, z in enumerate(areas):
+            gap = circle_rect_distance(hp["x"], hp["y"], radius, z)
+            if gap <= PROTECT_TOL:
+                if gap < 0.0:
+                    touch = f"孔圆已侵入该保护区约 {abs(gap):.2f}mm"
+                else:
+                    touch = (f"孔圆与该保护区相切或间距仅 {gap:.2f}mm"
+                             f"（容差 {PROTECT_TOL:g}mm 内按触碰处理）")
+                return (f"{source_desc}展开出的孔位 ({hp['x']:.2f}, {hp['y']:.2f}) "
+                        f"与{_area_text(zi, z)}{touch}，请移开打孔点或调整保护区。")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # SVG 生成
 # ---------------------------------------------------------------------------
 def _svg_header(w_mm, h_mm):
@@ -219,13 +309,49 @@ def _circle(cx, cy, r, extra=""):
             f'fill="#dc2626" stroke="#7f1d1d" stroke-width="0.12"{extra}/>\n')
 
 
-def build_unfolded_svg(width, height, holes, creases, radius, nv, nh):
-    """展开图 SVG。y 由数学坐标（自下而上）换算为 SVG 坐标（自上而下）。"""
+def _area_rect(z, h, bad=False, label=None):
+    """展开图中的保护区矩形。y 由数学坐标换算为 SVG 坐标。
+
+    正常保护区为琥珀色斜纹半透明；bad（越界）时为红色虚线并按实际范围画出，
+    即使超出 viewBox 也可提示越界方向（SVG 会按视口裁剪）。
+    """
+    x, y, w, hh = z["x"], h - z["y"] - z["h"], z["w"], z["h"]
+    if bad:
+        s = (f'<rect x="{x:.3f}" y="{y:.3f}" width="{w:.3f}" height="{hh:.3f}" '
+             'fill="#fecaca" fill-opacity="0.35" stroke="#dc2626" stroke-width="0.5" '
+             'stroke-dasharray="3 2"/>\n')
+    else:
+        s = (f'<rect x="{x:.3f}" y="{y:.3f}" width="{w:.3f}" height="{hh:.3f}" '
+             'fill="url(#areaHatch)" stroke="#b45309" stroke-width="0.35"/>\n')
+    # 矩形足够大才写编号标签，避免小框里挤字
+    if label and w >= 6.0 and hh >= 5.0:
+        s += (f'<text x="{x + 1.5:.3f}" y="{y + 4.5:.3f}" '
+              'font-size="4" fill="#92400e" font-family="sans-serif">'
+              f'{label}</text>\n')
+    return s
+
+
+def build_unfolded_svg(width, height, holes, creases, radius, nv, nh,
+                       areas=None, bad_area_idx=None, draw_holes=True):
+    """展开图 SVG。y 由数学坐标（自下而上）换算为 SVG 坐标（自上而下）。
+
+    areas 为保护区列表；draw_holes=False 时只画纸、折痕与保护区（孔位被
+    保护区判定拦截时的占位预览，此 SVG 不会被下载）。
+    """
     w, h, r = float(width), float(height), float(radius)
+    areas = areas or []
+    bad_area_idx = set(bad_area_idx or [])
     parts = [_svg_header(w, h)]
+    if areas:
+        parts.append(
+            '<defs><pattern id="areaHatch" patternUnits="userSpaceOnUse" '
+            'width="5" height="5" patternTransform="rotate(45)">'
+            '<rect width="5" height="5" fill="#fef3c7" fill-opacity="0.55"/>'
+            '<line x1="0" y1="0" x2="0" y2="5" stroke="#d97706" '
+            'stroke-width="0.5"/></pattern></defs>\n')
     parts.append(
         f'<desc>纸张 {w:g}x{h:g}mm；垂直对折 {nv} 次、水平对折 {nh} 次；'
-        f'共 {len(holes)} 个孔</desc>\n')
+        f'共 {len(holes) if draw_holes else 0} 个孔，保护区 {len(areas)} 个</desc>\n')
     for c in creases:
         if c["orient"] == "v":
             parts.append(
@@ -236,8 +362,12 @@ def build_unfolded_svg(width, height, holes, creases, radius, nv, nh):
             parts.append(
                 f'<line x1="0" y1="{yy:.3f}" x2="{w:.3f}" y2="{yy:.3f}" '
                 'stroke="#9ca3af" stroke-width="0.2" stroke-dasharray="2 1.5"/>\n')
-    for hp in holes:
-        parts.append(_circle(hp["x"], h - hp["y"], r))
+    for zi, z in enumerate(areas):
+        parts.append(_area_rect(z, h, bad=(zi in bad_area_idx),
+                                label=None if zi in bad_area_idx else f"P{zi + 1}"))
+    if draw_holes:
+        for hp in holes:
+            parts.append(_circle(hp["x"], h - hp["y"], r))
     parts.append("</svg>\n")
     return "".join(parts)
 
@@ -347,23 +477,45 @@ def compute(payload):
     w, h, edges, nv, nh = folded_state(width, height, folds)
     _check_face_capacity(w, h, radius)
 
+    # 保护区（原纸 mm 坐标）。越界不抛异常：返回带红框的预览与修正提示
+    areas, bad_area_idx, area_error = validate_areas(payload, width, height)
+
     # 客户端坐标是归一化的；换算为折叠面 mm 坐标
     mm_pts = [{"x": p["x"] * w, "y": p["y"] * h} for p in norm_pts]
 
     error_msg, error_idx = None, -1
-    holes, creases, unfolded_svg = [], [], None
+    holes, creases = [], crease_grid(width, height, nv, nh)
+    unfolded_svg = None
+
+    # 先逐点做折痕/边界校验（任一不过即停，沿用现有唯一错误孔的交互）
     for i, p in enumerate(mm_pts):
         err = check_point(p["x"], p["y"], w, h, radius, edges)
         if err:
             error_msg, error_idx = err, i
             break
 
-    if error_msg is None:
-        raw = unfold_points(mm_pts, folds, width, height)
-        holes = dedupe_points(raw)
-        creases = crease_grid(width, height, nv, nh)
+    if error_msg is None and not area_error:
+        # 每个折叠面打孔点单独展开，以便冲突时指出"原打孔点"
+        for i, p in enumerate(mm_pts):
+            one = dedupe_points(unfold_points([p], folds, width, height))
+            src = (f"原打孔点 #{i + 1}（折叠面坐标 ({p['x']:.2f}, {p['y']:.2f})mm）")
+            conflict = find_area_conflict(one, radius, areas, src)
+            if conflict:
+                error_msg, error_idx = conflict, i
+                break
+        if error_msg is None:
+            raw = unfold_points(mm_pts, folds, width, height)
+            holes = dedupe_points(raw)
+
+    if error_msg is None and area_error is None:
         unfolded_svg = build_unfolded_svg(
-            width, height, holes, creases, radius, nv, nh)
+            width, height, holes, creases, radius, nv, nh, areas)
+    else:
+        # 被拦截时仍给展开预览：只画纸张、折痕与保护区（不画孔），
+        # 该 SVG 仅供页面显示，永远不会进入下载接口
+        unfolded_svg = build_unfolded_svg(
+            width, height, [], creases, radius, nv, nh,
+            areas, bad_area_idx, draw_holes=False)
 
     folded_svg, pad, vb_w, vb_h = build_folded_svg(
         w, h, edges, mm_pts, radius, error_idx)
@@ -378,6 +530,9 @@ def compute(payload):
             "vbWidth": round(vb_w, 6), "vbHeight": round(vb_h, 6),
             "svg": folded_svg,
         },
+        "areas": areas,
+        "badAreaIndices": bad_area_idx,
+        "areaError": area_error,
         "creases": creases,
         "holeCount": len(holes),
         "expectedCount": len(mm_pts) * (2 ** len(folds)),
@@ -407,6 +562,11 @@ def reverse_lookup(payload):
     w, h, edges, nv, nh = folded_state(width, height, folds)
     _check_face_capacity(w, h, radius)
 
+    # 保护区越界（例如刚改过纸张尺寸）同样阻止反查确认
+    areas, _bad, area_error = validate_areas(payload, width, height)
+    if area_error:
+        raise ValueError(area_error)
+
     # 目标孔心在原纸上的校验（边界 + 全部折痕）
     err = check_target_on_paper(tx, ty, width, height, radius, nv, nh)
     if err:
@@ -423,6 +583,12 @@ def reverse_lookup(payload):
     # 复用现有展开算法，列出这一次打孔必然生成的全部孔位
     holes = dedupe_points(unfold_points([{"x": fx, "y": fy}], folds, width, height))
 
+    # 与普通打孔同一判定：任一展开孔与任一保护区相交或相切都禁止确认
+    src = f"反查目标孔心 ({tx:.2f}, {ty:.2f})mm"
+    conflict = find_area_conflict(holes, radius, areas, src)
+    if conflict:
+        raise ValueError(conflict)
+
     return {
         "ok": True,
         "target": {"x": round(tx, 6), "y": round(ty, 6)},
@@ -432,6 +598,7 @@ def reverse_lookup(payload):
         "foldedHeight": round(h, 6),
         "holes": holes,
         "holeCount": len(holes),
+        "areas": areas,
     }
 
 
@@ -443,6 +610,7 @@ def index():
     return render_template(
         "index.html",
         max_folds=MAX_FOLDS, max_holes=MAX_HOLES,
+        max_areas=MAX_PROTECTED_AREAS,
         min_dim=MIN_DIM, max_dim=MAX_DIM,
         min_radius=MIN_RADIUS, max_radius=MAX_RADIUS)
 
@@ -480,6 +648,8 @@ def api_download():
         result = compute(payload)
     except ValueError as exc:
         return _bad(str(exc))
+    if result["areaError"]:
+        return _bad(result["areaError"])
     if result["error"] or not result["unfoldedSvg"]:
         return _bad(result["error"] or "存在不合法孔位，无法生成展开图")
     return Response(
